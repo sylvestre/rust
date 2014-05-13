@@ -476,7 +476,7 @@ impl Clean<TyParamBound> for ast::TyParamBound {
     }
 }
 
-fn external_path(name: &str, substs: &ty::substs) -> Path {
+fn external_path(name: &str, substs: &subst::Substs) -> Path {
     Path {
         global: false,
         segments: vec![PathSegment {
@@ -499,7 +499,7 @@ impl Clean<TyParamBound> for ty::BuiltinBound {
             core::Typed(ref tcx) => tcx,
             core::NotTyped(_) => return RegionBound,
         };
-        let empty = ty::substs::empty();
+        let empty = subst::Substs::empty();
         let (did, path) = match *self {
             ty::BoundStatic => return RegionBound,
             ty::BoundSend =>
@@ -564,7 +564,7 @@ impl Clean<Vec<TyParamBound>> for ty::ParamBounds {
     }
 }
 
-impl Clean<Option<Vec<TyParamBound>>> for ty::substs {
+impl Clean<Option<Vec<TyParamBound>>> for subst::Substs {
     fn clean(&self) -> Option<Vec<TyParamBound>> {
         let mut v = Vec::new();
         match self.regions {
