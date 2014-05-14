@@ -47,6 +47,7 @@ extern crate time;
 extern crate log;
 
 pub mod middle {
+    pub mod def;
     pub mod trans;
     pub mod ty;
     pub mod ty_fold;

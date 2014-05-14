@@ -180,7 +180,7 @@ impl Clean<ExternalCrate> for cstore::crate_metadata {
                                                       self.cnum,
                                                       |def, _, _| {
                     let did = match def {
-                        decoder::DlDef(ast::DefMod(did)) => did,
+                        decoder::DlDef(def::DefMod(did)) => did,
                         _ => return
                     };
                     let attrs = inline::load_attrs(tcx, did);

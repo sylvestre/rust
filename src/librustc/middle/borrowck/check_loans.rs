@@ -25,7 +25,6 @@ use mc = middle::mem_categorization;
 use middle::ty;
 use middle::typeck::MethodCall;
 use syntax::ast;
-use syntax::ast_util;
 use syntax::codemap::Span;
 use syntax::visit::Visitor;
 use syntax::visit;
@@ -726,7 +725,7 @@ impl<'a> CheckLoanCtxt<'a> {
         let freevar_mode = freevars::get_capture_mode(self.tcx(), closure_id);
         freevars::with_freevars(self.tcx(), closure_id, |freevars| {
             for freevar in freevars.iter() {
-                let var_id = ast_util::def_id_of_def(freevar.def).node;
+                let var_id = freevar.def.def_id().node;
                 let var_path = Rc::new(LpVar(var_id));
                 self.check_if_path_is_moved(closure_id, span,
                                             MovedInCapture, &var_path);
