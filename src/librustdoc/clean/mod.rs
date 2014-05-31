@@ -25,6 +25,9 @@ use rustc::driver::driver;
 use rustc::metadata::cstore;
 use rustc::metadata::csearch;
 use rustc::metadata::decoder;
+use rustc::middle::def;
+use rustc::middle::subst;
+use rustc::middle::subst::VecPerParamSpace;
 use rustc::middle::ty;
 
 use std::rc::Rc;
@@ -47,6 +50,12 @@ pub trait Clean<T> {
 impl<T: Clean<U>, U> Clean<Vec<U>> for Vec<T> {
     fn clean(&self) -> Vec<U> {
         self.iter().map(|x| x.clean()).collect()
+    }
+}
+
+impl<T: Clean<U>, U> Clean<VecPerParamSpace<U>> for VecPerParamSpace<T> {
+    fn clean(&self) -> VecPerParamSpace<U> {
+        self.map(|x| x.clean())
     }
 }
 
@@ -477,17 +486,17 @@ impl Clean<TyParamBound> for ast::TyParamBound {
 }
 
 fn external_path(name: &str, substs: &subst::Substs) -> Path {
+    let lifetimes = substs.regions().get_vec(subst::TypeSpace)
+                    .iter()
+                    .filter_map(|v| v.clean())
+                    .collect();
+    let types = substs.types.get_vec(subst::TypeSpace).clean();
     Path {
         global: false,
         segments: vec![PathSegment {
             name: name.to_string(),
-            lifetimes: match substs.regions {
-                ty::ErasedRegions => Vec::new(),
-                ty::NonerasedRegions(ref v) => {
-                    v.iter().filter_map(|v| v.clean()).collect()
-                }
-            },
-            types: substs.tps.clean(),
+            lifetimes: lifetimes,
+            types: types,
         }],
     }
 }
@@ -567,12 +576,8 @@ impl Clean<Vec<TyParamBound>> for ty::ParamBounds {
 impl Clean<Option<Vec<TyParamBound>>> for subst::Substs {
     fn clean(&self) -> Option<Vec<TyParamBound>> {
         let mut v = Vec::new();
-        match self.regions {
-            ty::NonerasedRegions(..) => v.push(RegionBound),
-            ty::ErasedRegions => {}
-        }
-        v.extend(self.tps.iter().map(|t| TraitBound(t.clean())));
-
+        v.extend(self.regions().iter().map(|_| RegionBound));
+        v.extend(self.types.iter().map(|t| TraitBound(t.clean())));
         if v.len() > 0 {Some(v)} else {None}
     }
 }
@@ -606,7 +611,7 @@ impl Clean<Option<Lifetime>> for ty::Region {
             ty::ReStatic => Some(Lifetime("static".to_string())),
             ty::ReLateBound(_, ty::BrNamed(_, name)) =>
                 Some(Lifetime(token::get_name(name).get().to_string())),
-            ty::ReEarlyBound(_, _, name) => Some(Lifetime(name.clean())),
+            ty::ReEarlyBound(_, _, _, name) => Some(Lifetime(name.clean())),
 
             ty::ReLateBound(..) |
             ty::ReFree(..) |
@@ -627,17 +632,41 @@ pub struct Generics {
 impl Clean<Generics> for ast::Generics {
     fn clean(&self) -> Generics {
         Generics {
-            lifetimes: self.lifetimes.clean().move_iter().collect(),
-            type_params: self.ty_params.clean().move_iter().collect(),
+            lifetimes: self.lifetimes.clean(),
+            type_params: self.ty_params.clean(),
         }
     }
 }
 
 impl Clean<Generics> for ty::Generics {
     fn clean(&self) -> Generics {
+        // In the type space, generics can come in one of multiple
+        // namespaces.  This means that e.g. for fn items the type
+        // parameters will live in FnSpace, but for types the
+        // parameters will live in TypeSpace (trait definitions also
+        // define a parameter in SelfSpace). *Method* definitions are
+        // the one exception: they combine the TypeSpace parameters
+        // from the enclosing impl/trait with their own FnSpace
+        // parameters.
+        //
+        // In general, when we clean, we are trying to produce the
+        // "user-facing" generics. Hence we select the most specific
+        // namespace that is occupied, ignoring SelfSpace because it
+        // is implicit.
+
+        let space = {
+            if !self.types.get_vec(subst::FnSpace).is_empty() ||
+                !self.regions.get_vec(subst::FnSpace).is_empty()
+            {
+                subst::FnSpace
+            } else {
+                subst::TypeSpace
+            }
+        };
+
         Generics {
-            lifetimes: self.region_param_defs.clean(),
-            type_params: self.type_param_defs.clean(),
+            type_params: self.types.get_vec(space).clean(),
+            lifetimes: self.regions.get_vec(space).clean(),
         }
     }
 }
@@ -1249,8 +1278,13 @@ impl Clean<Type> for ty::t {
             }
             ty::ty_tup(ref t) => Tuple(t.iter().map(|t| t.clean()).collect()),
 
-            ty::ty_param(ref p) => Generic(p.def_id),
-            ty::ty_self(did) => Self(did),
+            ty::ty_param(ref p) => {
+                if p.space == subst::SelfSpace {
+                    Self(p.def_id)
+                } else {
+                    Generic(p.def_id)
+                }
+            }
 
             ty::ty_infer(..) => fail!("ty_infer"),
             ty::ty_err => fail!("ty_err"),
@@ -1939,8 +1973,8 @@ fn resolve_type(path: Path, tpbs: Option<Vec<TyParamBound>>,
     };
 
     match def {
-        ast::DefSelfTy(i) => return Self(ast_util::local_def(i)),
-        ast::DefPrimTy(p) => match p {
+        def::DefSelfTy(i) => return Self(ast_util::local_def(i)),
+        def::DefPrimTy(p) => match p {
             ast::TyStr => return Primitive(Str),
             ast::TyBool => return Primitive(Bool),
             ast::TyChar => return Primitive(Char),
@@ -1958,24 +1992,24 @@ fn resolve_type(path: Path, tpbs: Option<Vec<TyParamBound>>,
             ast::TyFloat(ast::TyF64) => return Primitive(F64),
             ast::TyFloat(ast::TyF128) => return Primitive(F128),
         },
-        ast::DefTyParam(i, _) => return Generic(i),
-        ast::DefTyParamBinder(i) => return TyParamBinder(i),
+        def::DefTyParam(_, i, _) => return Generic(i),
+        def::DefTyParamBinder(i) => return TyParamBinder(i),
         _ => {}
     };
     let did = register_def(&**cx, def);
     ResolvedPath { path: path, typarams: tpbs, did: did }
 }
 
-fn register_def(cx: &core::DocContext, def: ast::Def) -> ast::DefId {
+fn register_def(cx: &core::DocContext, def: def::Def) -> ast::DefId {
     let (did, kind) = match def {
-        ast::DefFn(i, _) => (i, TypeFunction),
-        ast::DefTy(i) => (i, TypeEnum),
-        ast::DefTrait(i) => (i, TypeTrait),
-        ast::DefStruct(i) => (i, TypeStruct),
-        ast::DefMod(i) => (i, TypeModule),
-        ast::DefStatic(i, _) => (i, TypeStatic),
-        ast::DefVariant(i, _, _) => (i, TypeEnum),
-        _ => return ast_util::def_id_of_def(def),
+        def::DefFn(i, _) => (i, TypeFunction),
+        def::DefTy(i) => (i, TypeEnum),
+        def::DefTrait(i) => (i, TypeTrait),
+        def::DefStruct(i) => (i, TypeStruct),
+        def::DefMod(i) => (i, TypeModule),
+        def::DefStatic(i, _) => (i, TypeStatic),
+        def::DefVariant(i, _, _) => (i, TypeEnum),
+        _ => return def.def_id(),
     };
     if ast_util::is_local(did) { return did }
     let tcx = match cx.maybe_typed {
